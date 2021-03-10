@@ -86,6 +86,8 @@ ynh_script_progression --message="Configuring system user..." --weight=2
 
 # Create a system user
 ynh_system_user_create --username=$app
+# Add user to render group
+adduser $app render
 
 #=================================================
 # MODIFY A CONFIG FILE
@@ -160,11 +162,11 @@ if [ $is_public -eq 1 ]
 then
 	# Everyone can access the app.
 	# The "main" permission is automatically created before the install script.
-	ynh_permission_update --permission "main" --add "visitors"
+	ynh_permission_update --permission="main" --add="visitors"
 fi
 
 # Only the admin can access the admin panel of the app (if the app has an admin panel)
-ynh_permission_create --permission "admin" --allowed $admin
+ynh_permission_create --permission="admin" --allowed=$admin
 
 #=================================================
 # RELOAD NGINX
