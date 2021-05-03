@@ -1,73 +1,209 @@
 #!/bin/bash
 
-# Exit on command errors and treat unset variables as an error
-set -eu
+#=================================================
+# GENERIC START
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
 
-# See comments in install script
-app=$YNH_APP_INSTANCE_NAME
-final_path=/opt/yunohost/$app
-
-# Source YunoHost helpers
+source _common.sh
 source /usr/share/yunohost/helpers
 
-# Stop jellyfin service
-systemctl stop jellyfin
+#=================================================
+# LOAD SETTINGS
+#=================================================
+ynh_script_progression --message="Loading installation settings..." --weight=1
+
+app=$YNH_APP_INSTANCE_NAME
+domain=$(ynh_app_setting_get --app=$app --key=domain)
+path_url=$(ynh_app_setting_get --app=$app --key=path)
+admin=$(ynh_app_setting_get --app=$app --key=admin)
+final_path=$(ynh_app_setting_get --app=$app --key=final_path)
+config_path=$(ynh_app_setting_get --app=$app --key=config_path)
+port=$(ynh_app_setting_get --app=$app --key=port)
 
 #=================================================
-# DOWNLOAD, CHECK AND UNPACK SOURCE
+# CHECK VERSION
 #=================================================
+ynh_script_progression --message="Checking version..."
 
-ynh_app_setting_set $app final_path $final_path
+upgrade_type=$(ynh_check_app_version_changed)
 
-# Download, check integrity, uncompress and patch the source from jellyfin-ffmpeg-[arch].src
-case `uname -m` in
-    x86_64) ynh_setup_source "$final_path" "jellyfin-ffmpeg-amd64" ;;
-    aarch64) ynh_setup_source "$final_path" "jellyfin-ffmpeg-arm64" ;;
-    *) ynh_die "Unknown arch" ;;
-esac
+#=================================================
+# ENSURE DOWNWARD COMPATIBILITY
+#=================================================
+ynh_script_progression --message="Ensuring downward compatibility..." --weight=1
 
-# Download, check integrity, uncompress and patch the source from jellyfin-[arch].src
-case `uname -m` in
-    x86_64) ynh_setup_source "$final_path" "jellyfin-amd64" ;;
-    aarch64) ynh_setup_source "$final_path" "jellyfin-arm64" ;;
-    *) ynh_die "Unknown arch" ;;
-esac
+architecture=$(dpkg --print-architecture)
+if [[ ! "$architecture" =~ ^(amd64|arm64|armhf)$ ]]; then
+    ynh_die "Jellyfin is not compatible with your architecture, $architecture, which is neither amd64, arm64, or armhf." 1
+fi
 
-# Download, check integrity, uncompress and patch the source from jellyfin-plugin-ldapauth.src
-ynh_setup_source "$final_path" "jellyfin-plugin-ldapauth"
+# If path keys do not exist, create it
+if [ -z "$config_path" ]; then
+	config_path=/var/lib/jellyfin
+	ynh_app_setting_set --app=$app --key=config_path --value=$config_path
+	final_path=/etc/jellyfin
+	ynh_app_setting_set --app=$app --key=final_path --value=$final_path
+fi
 
-#==============================================
-# INSTALL JELLYFIN
-#==============================================
+# Cleaning legacy permissions
+if ynh_legacy_permissions_exists; then
+	ynh_legacy_permissions_delete_all
 
-dpkg --install $final_path/jellyfin-ffmpeg.deb
-dpkg --install $final_path/jellyfin.deb
-rm $final_path/*.deb
+	ynh_app_setting_delete --app=$app --key=is_public
+fi
+
+if ! ynh_permission_exists --permission="admin"; then
+	# Create the required permissions
+	ynh_permission_create --permission="admin" --allowed=$admin
+fi
+
+#=================================================
+# BACKUP BEFORE UPGRADE THEN ACTIVE TRAP
+#=================================================
+ynh_script_progression --message="Backing up the app before upgrading (may take a while)..." --weight=3
+
+# Backup the current version of the app
+ynh_backup_before_upgrade
+ynh_clean_setup () {
+	# Restore it if the upgrade fails
+	ynh_restore_upgradebackup
+}
+# Exit if an error occurs during the execution of the script
+ynh_abort_if_errors
+
+#=================================================
+# STANDARD UPGRADE STEPS
+#=================================================
+# STOP SYSTEMD SERVICE
+#=================================================
+ynh_script_progression --message="Stopping a systemd service..." --weight=1
+
+ynh_systemd_action --service_name=$app --action="stop" --log_path="systemd" --line_match="Stopped Jellyfin Media Server" --timeout=15
 
 #=================================================
 # NGINX CONFIGURATION
 #=================================================
+ynh_script_progression --message="Upgrading NGINX web server configuration..." --weight=1
 
-# Create a dedicated nginx config
-#ynh_add_nginx_config
-
+# Create a dedicated NGINX config
+ynh_add_nginx_config
 
 #=================================================
-# UPGRADE CONFIG
+# UPGRADE DEPENDENCIES
 #=================================================
-#cp -a ../conf/loolwsd.xml /etc/loolwsd
-#ynh_replace_string "__NEXTCLOUDDOMAIN__" "$nextcloud_domain" "/etc/loolwsd/loolwsd.xml"
-#ynh_replace_string "__PASSWORD__" "$password" "/etc/loolwsd/loolwsd.xml"
-#systemctl restart loolwsd
+ynh_script_progression --message="Upgrading dependencies..." --weight=3
 
+# Prepare the source files (replace the placeholders with version, architecture, etc.
+ynh_add_config --template="../conf/ffmpeg.src.default" --destination="../conf/ffmpeg.src"
+ynh_add_config --template="../conf/server.src.default" --destination="../conf/server.src"
+ynh_add_config --template="../conf/web.src.default" --destination="../conf/web.src"
 
+# Create the temporary directory
+tempdir="$(mktemp -d)"
 
-# If app is public, add url to SSOWat conf as skipped_uris
-#if [[ $is_public -eq 1 ]]; then
-  # See install script
-#  ynh_app_setting_set "$app" unprotected_uris "/"
-#fi
+# Download the deb files
+ynh_setup_source_2 --dest_dir=$tempdir --source_id=ffmpeg
+ynh_setup_source_2 --dest_dir=$tempdir --source_id=server
+ynh_setup_source_2 --dest_dir=$tempdir --source_id=web
 
-# Start jellyfin service
-systemctl start jellyfin
+# Install the packages
+ynh_exec_warn_less apt-get -f install $tempdir/jellyfin-ffmpeg.deb -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew
+ynh_exec_warn_less apt-get -f install $tempdir/jellyfin-server.deb -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew
+ynh_exec_warn_less apt-get -f install $tempdir/jellyfin-web.deb -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew
 
+#=================================================
+# CREATE DEDICATED USER
+#=================================================
+ynh_script_progression --message="Making sure dedicated system user exists..." --weight=1
+
+# Create a dedicated user (if not existing)
+ynh_system_user_create --username=$app
+
+#=================================================
+# MODIFY A CONFIG FILE
+#=================================================
+
+# Check if network.xml exists (introduced in v10.7)
+if [ -z "/etc/jellyfin/network.xml" ]; then
+	ynh_script_progression --message="Configuring the settings..." --weight=1
+
+	ynh_backup_if_checksum_is_different --file="$config_path/network.xml"
+	ynh_backup_if_checksum_is_different --file="$config_path/system.xml"
+
+	# Load services once to generate network.xml
+	ynh_systemd_action --service_name=$app --action="restart" --log_path="systemd" --line_match="Started Jellyfin Media Server" --timeout=15
+	ynh_systemd_action --service_name=$app --action="stop" --log_path="systemd" --line_match="Stopped Jellyfin Media Server" --timeout=15
+
+	# Port config
+	ynh_replace_string --match_string="<PublicPort>8096</PublicPort>" --replace_string="<PublicPort>$port</PublicPort>" --target_file="$config_path/network.xml"
+	ynh_replace_string --match_string="<HttpServerPortNumber>8096</HttpServerPortNumber>" --replace_string="<HttpServerPortNumber>$port</HttpServerPortNumber>" --target_file="$config_path/network.xml"
+
+	# BaseUrl config
+	ynh_replace_string --match_string="<BaseUrl />" --replace_string="<BaseUrl>$path_url</BaseUrl>" --target_file="$config_path/network.xml"
+
+	ynh_store_file_checksum --file="$config_path/network.xml"
+	ynh_store_file_checksum --file="$config_path/system.xml"
+fi
+
+# Lower logging verbosity
+cp "$config_path/logging.default.json" "$config_path/logging.json"
+ynh_replace_string --match_string="\"Default\": \"Information\"" --replace_string="\"Default\": \"Error\"" --target_file="$config_path/logging.json"
+
+#=================================================
+# INSTALL LDAP PLUGIN
+#=================================================
+
+# Install it only if the plugin directory does not exist
+if [ ! -e "/var/lib/jellyfin/plugins/LDAP Authentication" ]; then
+	ynh_script_progression --message="Installing LDAP plugin..." --weight=2
+
+	ynh_setup_source --dest_dir="/var/lib/jellyfin/plugins/LDAP Authentication" --source_id=ldap
+	mkdir -p /var/lib/jellyfin/plugins/configurations/
+	ynh_add_config --template="../conf/LDAP-Auth.xml" --destination="/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml"
+fi
+
+#=================================================
+# GENERIC FINALIZATION
+#=================================================
+# SECURE FILES AND DIRECTORIES
+#=================================================
+
+# Set permissions on app files
+chown -R $app: $final_path
+
+#=================================================
+# SETUP LOGROTATE
+#=================================================
+ynh_script_progression --message="Configuring log rotation..." --weight=1
+
+# Use logrotate to manage application logfile(s)
+ynh_use_logrotate --non-append
+
+#=================================================
+# INTEGRATE SERVICE IN YUNOHOST
+#=================================================
+ynh_script_progression --message="Integrating service in YunoHost..." --weight=1
+
+yunohost service add $app --description="Jellyfin media center" --log_type="systemd"
+
+#=================================================
+# START SYSTEMD SERVICE
+#=================================================
+ynh_script_progression --message="Starting a systemd service..." --weight=1
+
+ynh_systemd_action --service_name=$app --action="start" --log_path="systemd" --line_match="Started Jellyfin Media Server" --timeout=15
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+ynh_script_progression --message="Reloading NGINX web server..." --weight=1
+
+ynh_systemd_action --service_name=nginx --action=reload
+
+#=================================================
+# END OF SCRIPT
+#=================================================
+
+ynh_script_progression --message="Upgrade of $app completed" --last
